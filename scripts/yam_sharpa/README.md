@@ -91,7 +91,8 @@ These work in both scripts:
 | option | what it does |
 |---|---|
 | `--ckpt-dir DIR` | use a checkpoint folder elsewhere, e.g. `/root/data/openwam_ckpt/fingertips_abs_100k` |
-| `--compile` | `torch.compile` the model, as our experiments did. Each inference is a bit faster, but the first one waits a few minutes. Off by default. |
+| `--no-compile` | skip `torch.compile`: quicker start, slower inference (see "Speed" below) |
+| `--no-cuda-graphs` | compile without CUDA graphs, like `configs/deploy.yaml` and our latency experiments |
 | `--device cuda:N` | which GPU |
 
 These work in `test_one_inference.py` only:
@@ -99,7 +100,7 @@ These work in `test_one_inference.py` only:
 | option | what it does |
 |---|---|
 | `--seed N` | seed for the random input and the model's starting noise |
-| `--repeat N` | extra timed runs on the same input |
+| `--repeat N` | extra timed runs on the same input, each with a new noise seed |
 | `--save-input PATH` | save the stacked 480 x 320 picture as a PNG |
 
 ## What the test does and what to expect
@@ -116,20 +117,56 @@ These work in `test_one_inference.py` only:
 4. Runs 10 denoising steps.
 5. Checks the 32 x 48 result.
 
-Output on this devbox (RTX PRO 6000 Blackwell, no compile, 2026-10-30):
+Output of `--repeat 10` on this devbox (RTX PRO 6000 Blackwell, all speed-ups on, 2026-10-31):
 
 ```
-model loaded in 56 s, GPU memory in use 23.1 GiB
+model loaded in ~57 s, GPU memory in use 23.1 GiB
 actions shape  : (32, 48)
 all finite     : True
 inside training range (+-5%): 100.0% of the numbers
-time           : 1.75 s              (first run: warm-up)
-repeat 1: 0.37 s, same actions as the first run: True
+time           : 9.13 s (DiT cache skipped 3 of the denoising steps)     first run: compiles + warm-up
+repeat 1 (seed 1): 0.276 s, DiT cache skipped 3 steps
+repeat 2 (seed 2): 0.163 s, DiT cache skipped 6 steps
+...
+repeats: median 0.162 s, fastest 0.161 s
 OK
 ```
 
 It prints `OK` and exits with code 0 when the chunk has shape (32, 48) and every number is finite. It exits with 1
 otherwise. On random input the actions are meaningless; the test only shows the model runs end to end.
+
+The first run compiles. It takes ~45 s the very first time, and ~9 s once torch's on-disk compile cache has it.
+
+## Speed
+
+The OpenWAM paper (arXiv 2609.07398, section 3.3, Figure 4) reports ~175 ms per inference for this architecture
+(dual-system joint self-attention, Wan2.2-TI2V-5B) on an RTX 5090. It gets there with four speed-ups; the scripts
+turn all four on by default:
+
+| speed-up | what it does | setting |
+|---|---|---|
+| prompt-embedding cache | runs the text encoder once per distinct prompt | `deploy.yaml`, always on |
+| video-decode skip | never turns the predicted video back into pixels; only the actions are used | `deploy.yaml`, always on |
+| DiT velocity cache | when the prediction barely changes between denoising steps, reuses it instead of running the network (at most 3 skips in a row) | `deploy.yaml`, always on |
+| `torch.compile` + CUDA graphs | compiles the denoising loop and replays it as recorded GPU kernels | on; `--no-compile`, `--no-cuda-graphs` |
+
+`configs/deploy.yaml` compiles this architecture without CUDA graphs (`optimization.compile.self_attn.torch_mode:
+default`). The paper uses them, so `load_model` switches that one setting to `reduce-overhead`. It does this in the
+script only; `deploy.yaml` is not edited.
+
+Measured here, median of 10 inferences with different seeds:
+
+| setting | time per inference |
+|---|---|
+| nothing (no compile, no DiT cache) | 498 ms |
+| DiT cache only | 212 ms |
+| DiT cache + compile (= `deploy.yaml`, our latency experiments) | 173 ms |
+| DiT cache + compile + CUDA graphs (the scripts' default, as in the paper) | 163 ms |
+
+**The time per inference depends on the noise seed.** The DiT cache skips either 6 or 3 of the 10 denoising steps,
+depending on the starting noise. For this checkpoint, 15 of 20 seeds got 6 skips. With all speed-ups on, that is
+~162 ms for 6 skips and ~275 ms for 3; without compile, ~210 ms and ~360 ms. A test that reuses one seed sees only
+one of the two levels: seed 0 is a 3-skip seed.
 
 ## Notes
 

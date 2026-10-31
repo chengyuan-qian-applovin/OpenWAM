@@ -50,7 +50,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import subprocess
 import sys
 import time
@@ -114,20 +113,40 @@ class LoadedModel:
     cfg: object
 
 
-def load_model(ckpt_dir: Path = DEFAULT_CKPT_DIR, device: str = "cuda", compile: bool = False,
-               denoise_steps: int | None = None) -> LoadedModel:
+def load_model(
+    ckpt_dir: Path = DEFAULT_CKPT_DIR,
+    device: str = "cuda",
+    compile: bool = True,
+    cuda_graphs: bool = True,
+    denoise_steps: int | None = None,
+) -> LoadedModel:
     """Load the checkpoint the same way our evaluation server does (``scripts/openwam_chunk_server.py`` in
     sim-policy-eval): OpenWAM's own deploy code, ``configs/deploy.yaml`` defaults.
 
     Takes ~1-2 minutes and ~25 GB of GPU memory (the weights are kept in bfloat16).
 
+    Speed-ups. The OpenWAM paper (arXiv 2609.07398, section 3.3) uses four, all on here by default:
+      - prompt-embedding cache: the text encoder runs once per distinct prompt, not on every inference
+        (deploy.yaml ``optimization.prompt_embed_cache``, always on here);
+      - video-decode skip: the predicted video is never turned back into pixels, only the actions are used
+        (``optimization.decode_video: false``, always on here);
+      - DiT velocity cache: when the model's prediction barely changes from one denoising step to the next, the next
+        step reuses it instead of running the network (``optimization.dit_cache``, always on here). How many of the
+        10 steps it skips depends on the starting noise: for this checkpoint either 6 (~165 ms per inference
+        with compile) or 3 (~275 ms), so the time varies from one inference to the next;
+      - compilation (``compile``) with CUDA graphs (``cuda_graphs``), see below.
+
     Args:
         ckpt_dir: folder with config.yaml, the .safetensors, normalization_stats.npy and tokenizer/.
         device: GPU to load on, e.g. ``"cuda"`` or ``"cuda:1"``.
-        compile: ``torch.compile`` the model. Our experiments ran with it on (deploy.yaml's default): each
-            inference is faster afterwards, but the first one waits a few extra minutes for compilation. Off
-            here by default, which suits a quick test; the actions differ from compiled ones only by float
-            rounding (~1e-3).
+        compile: ``torch.compile`` the denoising loop. On by default, as in the paper and our experiments: each
+            inference is faster afterwards (6-skip case ~210 ms -> ~165 ms), but the first one waits for compilation
+            (~45 s; less when torch's on-disk compile cache already has it). The actions differ from uncompiled ones
+            only by float rounding (~1e-3).
+        cuda_graphs: with ``compile``, also record the compiled loop as CUDA graphs (torch's "reduce-overhead"
+            mode), which the paper does: the GPU replays the recorded kernels instead of the CPU launching each one.
+            deploy.yaml leaves this off for this architecture (``optimization.compile.self_attn.torch_mode:
+            default``); turning it on saves another ~10 ms. Our latency experiments ran with it off.
         denoise_steps: how many denoising steps per inference; None keeps deploy.yaml's 10.
 
     Returns:
@@ -137,9 +156,12 @@ def load_model(ckpt_dir: Path = DEFAULT_CKPT_DIR, device: str = "cuda", compile:
 
     from openwam.deploy.server import _load_deploy_yaml, build_server_from_config
 
-    # 1. Deploy settings: start from the repo's configs/deploy.yaml and apply our two switches.
+    # 1. Deploy settings: start from the repo's configs/deploy.yaml and apply our switches.
     deploy_cfg = _load_deploy_yaml(str(REPO_ROOT / "configs" / "deploy.yaml"))
     OmegaConf.update(deploy_cfg, "optimization.compile.enabled", bool(compile), merge=False)
+    if cuda_graphs:
+        # "self_attn" is the compile section of this checkpoint's architecture (dual_system, joint_self_attn).
+        OmegaConf.update(deploy_cfg, "optimization.compile.self_attn.torch_mode", "reduce-overhead", merge=False)
     if denoise_steps is not None:
         OmegaConf.update(deploy_cfg, "inference.denoise_steps", int(denoise_steps), merge=False)
 
@@ -162,14 +184,24 @@ def describe(model: LoadedModel) -> None:
 
     print("\nLoaded OpenWAM checkpoint")
     print(f"  action representation : {get('dataloader.action_mode')}")
-    print(f"  cameras (top to bottom): {list(get('dataloader.camera_layout'))}, "
-          f"layout {get('dataloader.multiview_layout')}")
+    print(
+        f"  cameras (top to bottom): {list(get('dataloader.camera_layout'))}, "
+        f"layout {get('dataloader.multiview_layout')}"
+    )
     print(f"  model input picture   : {get('inference.height')} x {get('inference.width')} pixels (height x width)")
     print(f"  state numbers         : {get('model.architecture.state_dim')}")
-    print(f"  action chunk          : {int(get('inference.num_frames')) - 1} steps x "
-          f"{get('model.architecture.action_dim')} numbers")
+    print(
+        f"  action chunk          : {int(get('inference.num_frames')) - 1} steps x "
+        f"{get('model.architecture.action_dim')} numbers"
+    )
     print(f"  denoising steps       : {get('inference.denoise_steps')}")
-    print(f"  torch.compile         : {get('optimization.compile.enabled')}")
+    print(
+        f"  speed-ups             : compile {get('optimization.compile.enabled')} "
+        f"(mode {get('optimization.compile.self_attn.torch_mode')}; reduce-overhead = CUDA graphs), "
+        f"DiT cache {get('optimization.dit_cache.enabled')}, "
+        f"prompt cache {get('optimization.prompt_embed_cache.enabled')}, "
+        f"video decode {get('optimization.decode_video')}"
+    )
     try:
         import torch
 
@@ -180,12 +212,16 @@ def describe(model: LoadedModel) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--ckpt-dir", type=Path, default=DEFAULT_CKPT_DIR,
-                    help=f"where the checkpoint is / goes (default {DEFAULT_CKPT_DIR})")
+    ap.add_argument(
+        "--ckpt-dir",
+        type=Path,
+        default=DEFAULT_CKPT_DIR,
+        help=f"where the checkpoint is / goes (default {DEFAULT_CKPT_DIR})",
+    )
     ap.add_argument("--download-only", action="store_true", help="download, do not load")
     ap.add_argument("--skip-download", action="store_true", help="the files are already in --ckpt-dir")
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--compile", action="store_true", help="torch.compile the model (as our experiments did)")
+    add_speed_arguments(ap)
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -193,7 +229,19 @@ def main() -> None:
         download_checkpoint(args.ckpt_dir)
     if args.download_only:
         return
-    describe(load_model(args.ckpt_dir, device=args.device, compile=args.compile))
+    describe(
+        load_model(args.ckpt_dir, device=args.device, compile=not args.no_compile, cuda_graphs=not args.no_cuda_graphs)
+    )
+
+
+def add_speed_arguments(ap: argparse.ArgumentParser) -> None:
+    """The ``--no-compile`` / ``--no-cuda-graphs`` switches, shared with test_one_inference.py."""
+    ap.add_argument("--no-compile", action="store_true", help="skip torch.compile: quicker start, slower inference")
+    ap.add_argument(
+        "--no-cuda-graphs",
+        action="store_true",
+        help="compile without CUDA graphs, as configs/deploy.yaml and our latency experiments",
+    )
 
 
 if __name__ == "__main__":
